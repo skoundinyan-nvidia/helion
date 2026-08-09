@@ -427,6 +427,30 @@ class TestPallasJaggedCarryRejects(TestCase):
         ):
             _run(seq_offsets, jagged, dense, [8, 128, 128], kernel=kernel)
 
+    def test_untiled_column_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas")
+        def jagged_full_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, _ = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty_like(jagged)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    out[st, :] = jagged[st, :] * 2
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError, "requires ordered carry"
+        ):
+            jagged_full_row_store.bind((seq_offsets, jagged)).to_triton_code(
+                helion.Config(block_sizes=[16], pallas_loop_type="emit_pipeline")
+            )
+
     def test_multi_grid_group_rejected(self) -> None:
         # The fold guard keys seq_offsets program_id(0), so a second grid dimension is
         # refused rather than folding against the wrong program id.

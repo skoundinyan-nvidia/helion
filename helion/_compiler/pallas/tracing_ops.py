@@ -2151,16 +2151,24 @@ def _aligned_dim(
 
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
-    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
-        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
-            continue
-        dim_to_bid = _get_dim_block_ids(sub_meta, env)
-        lane_block = _lane_tile(state, fake, dim_to_bid)
-        for dim, dim_bid in dim_to_bid.items():
-            if _slice_addressing(fake, dim, lane_block) is SliceAddressing.ALIGNED:
-                addressing[dim_bid] = SliceAddressing.ALIGNED
-            else:
-                addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
+    stored_bids: set[int] = set()
+    for tensors, is_store in (
+        (loaded_tensors, False),
+        (stored_tensors, True),
+    ):
+        for fake, _node, sub_meta in tensors.values():
+            dim_to_bid = _get_dim_block_ids(sub_meta, env)
+            if is_store:
+                stored_bids.update(dim_to_bid.values())
+            if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+                continue
+            lane_block = _lane_tile(state, fake, dim_to_bid)
+            for dim, dim_bid in dim_to_bid.items():
+                access_addressing = _slice_addressing(fake, dim, lane_block)
+                if access_addressing is SliceAddressing.ALIGNED:
+                    addressing[dim_bid] = SliceAddressing.ALIGNED
+                else:
+                    addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
     sublane = max(sublanes)
     aligned_dim: dict[int, int] = {}
@@ -2171,16 +2179,23 @@ def _aligned_dim(
         direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
         if direct and not carry:
             continue  # reads any offset; a plain clamped slice suffices
-        if not carry and not is_row_map_axis(state, bid):
-            # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
-            # dense bf16 output store can't be proven aligned for Mosaic (E2003),
-            # so reject it cleanly here instead.  f32 reductions are DIRECT and
-            # already skipped above.
-            raise NotImplementedError(
-                "Pallas: bf16 reduction over a jagged row is not supported yet "
-                "(its dense bf16 output store cannot be proven sublane-aligned)."
-            )
+        if not carry:
+            if bid in stored_bids:
+                raise NotImplementedError(
+                    "Pallas: a jagged row tile whose slices must be "
+                    "sublane-aligned and that is written through its row dim is "
+                    "only supported when ordered carry can stitch the store."
+                )
+            if not is_row_map_axis(state, bid):
+                # ALIGNED but not a map axis: a bf16 reduction over the row. Its
+                # dense bf16 output store cannot be proven aligned for Mosaic, so
+                # reject it cleanly here instead. f32 reductions are DIRECT above.
+                raise NotImplementedError(
+                    "Pallas: bf16 reduction over a jagged row is not supported yet "
+                    "(its dense bf16 output store cannot be proven sublane-aligned)."
+                )
         aligned_dim[bid] = sublane
+        state.device_function.aligned_tiles[bid] = sublane
         if carry:
             begin, end = _get_loop_begin_and_end(state, i)
             state.device_function.carry_tiles[bid] = CarryBoundaryTile(
@@ -2190,6 +2205,46 @@ def _aligned_dim(
                 sublane=sublane,
             )
     return aligned_dim
+
+
+def _sublane_aligned(state: CodegenState, block_id: int) -> int | None:
+    """S when a jagged dim's tile offsets are multiples of the sublane tile.
+
+    A dim ``_aligned_dim`` recorded in ``aligned_tiles`` starts at an S-aligned
+    begin and steps by its block size, so every tile offset is a true multiple
+    of S once the block size is one too.  ``pl.multiple_of`` is then an honest
+    promise, and it is what lets Mosaic slice a tiled (sublane) dim at a runtime
+    offset.  Returns None for every other dim, whose offset must stay as-is.
+    """
+    sublane = state.device_function.aligned_tiles.get(block_id)
+    if sublane is None:
+        return None
+    block = state.device_function.resolved_block_size(block_id)
+    if not isinstance(block, int) or block % sublane != 0:
+        return None
+    return sublane
+
+
+def _aligned_offset(
+    state: CodegenState,
+    block_id: int,
+    offset_expr: str,
+    *,
+    steps_by_block: bool = True,
+) -> str:
+    """Wrap ``offset_expr`` in ``pl.multiple_of`` when the promise is honest.
+
+    ``pl.multiple_of`` is assume_multiple: it suppresses Mosaic's tiled-row
+    alignment check rather than proving anything, so it may only be claimed for a
+    dim whose own loop really rounded its begin to the sublane
+    (``_sublane_aligned``) and that steps by its block size.  Claiming it for an
+    unaligned window would let Mosaic read from the wrong row instead of
+    rejecting.  Every other offset comes back unchanged.
+    """
+    aligned = _sublane_aligned(state, block_id) if steps_by_block else None
+    if aligned is None:
+        return offset_expr
+    return f"pl.multiple_of({offset_expr}, {aligned})"
 
 
 def _codegen_emit_pipeline(state: CodegenState) -> object:
@@ -2354,9 +2409,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         )
                     else:
                         size_expr = slice_size_expr
-                    if bid in state.device_function.carry_tiles:
-                        sublane = state.device_function.carry_tiles[bid].sublane
-                        start_expr = f"pl.multiple_of({start_expr}, {sublane})"
+                    # Carried tiles are aligned tiles, so this covers them too.
+                    start_expr = _aligned_offset(
+                        state,
+                        bid,
+                        start_expr,
+                        steps_by_block=iter_step_expr == block_size_vars[bid_idx],
+                    )
                     lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
@@ -2384,19 +2443,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
             elif bid is not None and is_dynamic_bound_tile(state, bid):
-                # Jagged row tile from an inner pipeline.  pl.multiple_of is
-                # assume_multiple: it suppresses the tiled-row alignment check.
-                # Safe because the begin is rounded to the sublane in the dim's
-                # own loop, and a DIRECT f32 single-lane-tile row reads
-                # contiguously.  Always emitted, as sibling loops reference the
-                # same jagged dim.  Must precede the outer-non-grid branch.
+                # Jagged row tile from an inner pipeline.  Always emitted, as
+                # sibling loops reference the same jagged dim.  Must precede the
+                # outer-non-grid branch.
                 block_m = state.device_function.block_size_var(bid)
-                offset_v = state.codegen.offset_var(bid)
-                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
+                start_expr = _aligned_offset(state, bid, state.codegen.offset_var(bid))
                 block_shape_parts.append(f"pl.BoundedSlice({block_m})")
-                lambda_parts.append(
-                    f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"
-                )
+                lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
