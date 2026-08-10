@@ -214,14 +214,15 @@ _sort_order: dict[type[Argument], int] = {
 class ScratchArg:
     """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
 
-    scratch_type can be "vmem" (default) for VMEM buffers or "dma_semaphore"
-    for DMA semaphores used with pltpu.make_async_copy.
+    scratch_type can be "vmem" (default) or "dma_semaphore" for Pallas
+    scratch.
     """
 
     name: str
     shape: tuple[int | torch.SymInt, ...]
     dtype: torch.dtype | None  # None for semaphores
-    scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
+    scratch_type: str = "vmem"
+    shape_sources: tuple[tuple[torch.Tensor, int] | None, ...] | None = None
 
 
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
@@ -331,6 +332,11 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
+        self.requires_collective_id = False
+        self.requires_remote_copy = False
+        # Descriptor lifecycle operations may live in nested control-flow
+        # graphs. Backends resolve them through this compiler-owned table.
+        self.remote_copy_descriptors: dict[int, object] = {}
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
@@ -1144,6 +1150,7 @@ class DeviceFunction:
         dtype: torch.dtype | None,
         name_hint: str = "scratch",
         scratch_type: str = "vmem",
+        shape_sources: tuple[tuple[torch.Tensor, int] | None, ...] | None = None,
     ) -> str:
         """Register a scratch memory buffer and return its variable name."""
         if CompileEnvironment.current().backend_name != "pallas":
@@ -1151,7 +1158,11 @@ class DeviceFunction:
                 "register_scratch is only supported by the Pallas backend"
             )
         name = self.new_var(name_hint)
-        self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
+        if shape_sources is not None and len(shape_sources) != len(shape):
+            raise ValueError("scratch shape sources must match the scratch rank")
+        self._scratch_args.append(
+            ScratchArg(name, shape, dtype, scratch_type, shape_sources)
+        )
         return name
 
     def scratch_read_slice(self, name: str) -> str | None:
@@ -1171,6 +1182,7 @@ class DeviceFunction:
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
+        from helion.language import distributed_ops
         from helion.language import memory_ops
         from helion.language import tile_index
         from helion.language.atomic_ops import ATOMIC_OPS
@@ -1196,7 +1208,13 @@ class DeviceFunction:
                         return None
                     tensor_val = tensor_arg.meta.get("val")
                     assert isinstance(tensor_val, torch.Tensor)
-                    return self.tensor_arg(tensor_val).name
+                    try:
+                        return self.tensor_arg(tensor_val).name
+                    except KeyError:
+                        # Device-created tensors are compiler-managed scratch,
+                        # not host arguments that need BlockSpec read/write
+                        # classification.
+                        return None
 
                 if node.target is memory_ops.load:
                     name = _get_tensor_name(node)
@@ -1211,6 +1229,23 @@ class DeviceFunction:
                     if name is not None:
                         read_names.add(name)
                         write_names.add(name)
+                elif node.target is distributed_ops.make_async_remote_copy:
+                    if len(node.args) != 5:
+                        raise exc.InternalError(
+                            RuntimeError(
+                                "remote copy was not normalized to "
+                                "its five-argument form"
+                            )
+                        )
+                    src_name = _get_tensor_name(node)
+                    if src_name is not None:
+                        read_names.add(src_name)
+                    dst_arg = node.args[3]
+                    if isinstance(dst_arg, torch.fx.Node):
+                        dst_value = dst_arg.meta.get("val")
+                        if isinstance(dst_value, torch.Tensor):
+                            with contextlib.suppress(KeyError):
+                                write_names.add(self.tensor_arg(dst_value).name)
         return read_names, write_names
 
     def __enter__(self) -> None:

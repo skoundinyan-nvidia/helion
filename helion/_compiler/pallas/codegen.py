@@ -424,6 +424,12 @@ def index_parts(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
+    *,
+    indexing_patterns: list[object] | None = None,
+    ast_subscripts: list[ast.AST] | None = None,
+    pipeline_scalar_indices_local: bool = True,
+    tensor_indices_are_scalars: bool = False,
+    raw_hbm_ref: bool = False,
 ) -> tuple[list[str], list[int]]:
     """Build a JAX/Pallas index string from a Helion subscript list.
 
@@ -455,7 +461,8 @@ def index_parts(
         pipeline_block_ids.update(loop.block_ids)
 
     # Use pre-computed indexing patterns from plan_tiling analysis
-    indexing_patterns = _get_indexing_patterns(state, tensor)
+    if indexing_patterns is None:
+        indexing_patterns = _get_indexing_patterns(state, tensor)
 
     # Build parts using the pre-computed patterns
     parts: list[str] = []
@@ -471,7 +478,18 @@ def index_parts(
 
         # Generate code based on the pattern type
         index_code = _generated_index_code(
-            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern,
+            idx,
+            state,
+            tensor,
+            i,
+            tensor_dim,
+            in_pipeline,
+            pipeline_block_ids,
+            ast_subscripts,
+            pipeline_scalar_indices_local,
+            tensor_indices_are_scalars,
+            raw_hbm_ref,
         )
         parts.append(index_code)
 
@@ -495,14 +513,16 @@ def _arbitrary_index_pattern_code(
     state: CodegenState,
     subscript_index: int,
     in_pipeline: bool,
+    ast_subscripts: list[ast.AST] | None,
+    pipeline_scalar_indices_local: bool,
 ) -> str:
     from helion._utils import is_scalar_index
 
-    if in_pipeline and is_scalar_index(idx):
+    if in_pipeline and pipeline_scalar_indices_local and is_scalar_index(idx):
         return "0"
     if isinstance(idx, int):
         return str(idx)
-    return _index_expr_from_ast(state, subscript_index)
+    return _index_expr_from_ast(state, subscript_index, ast_subscripts)
 
 
 def _generated_index_code(
@@ -514,6 +534,10 @@ def _generated_index_code(
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
+    ast_subscripts: list[ast.AST] | None,
+    pipeline_scalar_indices_local: bool,
+    tensor_indices_are_scalars: bool,
+    raw_hbm_ref: bool,
 ) -> str:
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -525,7 +549,14 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern,
+            idx,
+            state,
+            tensor,
+            tensor_dim,
+            in_pipeline,
+            pipeline_block_ids,
+            raw_hbm_ref,
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
@@ -535,7 +566,14 @@ def _generated_index_code(
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern,
+            state,
+            subscript_index,
+            tensor_dim,
+            in_pipeline,
+            pipeline_block_ids,
+            ast_subscripts,
+            raw_hbm_ref,
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -543,10 +581,18 @@ def _generated_index_code(
 
     if isinstance(pattern, ArbitraryIndexPattern):
         return _arbitrary_index_pattern_code(
-            pattern, idx, state, subscript_index, in_pipeline
+            pattern,
+            idx,
+            state,
+            subscript_index,
+            in_pipeline,
+            ast_subscripts,
+            pipeline_scalar_indices_local,
         )
 
     if isinstance(pattern, TensorIndexPattern):
+        if tensor_indices_are_scalars:
+            return _index_expr_from_ast(state, subscript_index, ast_subscripts)
         from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
         from helion._compiler.pallas.tensorcore_plan import TensorCorePlan
 
@@ -575,6 +621,7 @@ def _tile_pattern_code(
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
+    raw_hbm_ref: bool,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -584,6 +631,11 @@ def _tile_pattern_code(
     assert isinstance(pattern, TilePattern)
 
     block_id = pattern.block_id
+
+    # Raw HBM refs have no surrounding BlockSpec to apply the grid tile.
+    # Address the global HBM slice explicitly instead of using the local ':'.
+    if raw_hbm_ref:
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     # Pipeline-tiled dims are already sliced by emit_pipeline / fori_loop's
     # BlockSpec or DMA copy, so the body should use ``:`` regardless of
@@ -634,6 +686,8 @@ def _tile_begin_with_offset_pattern_code(
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
+    ast_subscripts: list[ast.AST] | None,
+    raw_hbm_ref: bool,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -643,13 +697,19 @@ def _tile_begin_with_offset_pattern_code(
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
 
+    if raw_hbm_ref:
+        offset = state.codegen.offset_var(block_id)
+        if pattern.offset != 0:
+            offset = f"{offset} + {offset_str}"
+        return offset
+
     if in_pipeline and block_id in pipeline_block_ids:
         return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)
 
     if not can_tile:
-        return _index_expr_from_ast(state, subscript_index)
+        return _index_expr_from_ast(state, subscript_index, ast_subscripts)
 
     assert isinstance(pattern.offset, int)
 
@@ -663,9 +723,15 @@ def _tile_begin_with_offset_pattern_code(
     return f"{pattern.offset}"
 
 
-def _index_expr_from_ast(state: CodegenState, subscript_index: int) -> str:
-    ast_subscripts = state.ast_args[1]
-    assert isinstance(ast_subscripts, list)
+def _index_expr_from_ast(
+    state: CodegenState,
+    subscript_index: int,
+    ast_subscripts: list[ast.AST] | None = None,
+) -> str:
+    if ast_subscripts is None:
+        ast_arg = state.ast_args[1]
+        assert isinstance(ast_arg, list)
+        ast_subscripts = ast_arg
     ast_idx = ast_subscripts[subscript_index]
     assert isinstance(ast_idx, ast.AST)
     name = state.codegen.lift(ast_idx, dce=True, prefix="index")
