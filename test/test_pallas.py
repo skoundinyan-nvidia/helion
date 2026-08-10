@@ -1251,13 +1251,13 @@ class TestPallas(TestCase):
 
         x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
         out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(helion.exc.InvalidIndexingType) as caught:
+        with self.assertRaises(helion.exc.BackendUnsupported) as caught:
             code_and_output(permute_then_narrow, (x, out), pallas_loop_type="fori_loop")
         self.assertIn("aten.permute.default", str(caught.exception))
         self.assertIn("aten.reshape.default", str(caught.exception))
 
-    def test_resident_subview_reports_incompatible_view_config(self) -> None:
-        """A physical-layout mismatch rejects only the current config."""
+    def test_resident_subview_reports_incompatible_static_view(self) -> None:
+        """A fixed physical-layout mismatch reports a backend limitation."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def reshape_then_narrow(x: torch.Tensor, out: torch.Tensor) -> None:
@@ -1274,12 +1274,12 @@ class TestPallas(TestCase):
         x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
         out = torch.empty(1, 4, 64, device=DEVICE, dtype=torch.float32)
         with self.assertRaisesRegex(
-            helion.exc.InvalidConfig,
+            helion.exc.BackendUnsupported,
             r"aten\.(reshape|view)\.default.*two minor dimensions",
         ):
             code_and_output(reshape_then_narrow, (x, out), pallas_loop_type="fori_loop")
 
-    def test_resident_subview_recursive_rejection_keeps_config_kind(self) -> None:
+    def test_resident_subview_recursive_failure_keeps_cause(self) -> None:
         """A child failure invalidates every tentative ancestor with its cause."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1304,7 +1304,7 @@ class TestPallas(TestCase):
         )
         self.assertNarrowingIsResident(code)
         with self.assertRaisesRegex(
-            helion.exc.InvalidConfig, "may contain padding.*this config"
+            helion.exc.BackendUnsupported, "may contain padding.*this config"
         ):
             code_and_output(
                 nested_narrowing,
@@ -1335,7 +1335,7 @@ class TestPallas(TestCase):
         out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
         sink = torch.empty(2, 4, 64, device=DEVICE, dtype=torch.float32)
         with self.assertRaisesRegex(
-            helion.exc.InvalidIndexingType,
+            helion.exc.BackendUnsupported,
             "masked selection.*another narrowing subscript",
         ):
             code_and_output(
@@ -1713,7 +1713,8 @@ class TestPallas(TestCase):
         # sizes are powers of two, so a run that fits always divides; the width
         # check is the gate that actually varies with config.
         with self.assertRaisesRegex(
-            helion.exc.InvalidConfig, "block holds only 2 rows for this config"
+            helion.exc.BackendUnsupported,
+            "block holds only 2 rows for this config",
         ):
             code_and_output(
                 divisible, (x, out), block_sizes=[2], pallas_loop_type="fori_loop"
@@ -1735,7 +1736,7 @@ class TestPallas(TestCase):
 
         x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
         out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(helion.exc.InvalidIndexingType):
+        with self.assertRaises(helion.exc.BackendUnsupported):
             code_and_output(shifted_extent, (x, out), pallas_loop_type="fori_loop")
 
     def test_resident_subview_names_the_blocking_consumer(self) -> None:
